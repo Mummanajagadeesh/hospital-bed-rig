@@ -1,6 +1,7 @@
 import sys
 import cv2
 import mediapipe as mp
+from collections import deque
 from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QLabel, QPushButton, QWidget, QStackedWidget
 from PyQt5.QtCore import QThread, pyqtSignal, QTimer
 
@@ -13,8 +14,10 @@ class EyeBlinkDetector(QThread):
         self.camera_url = camera_url
         self.running = True
         self.last_blink_time = None
-        self.blink_threshold = 0.5  # Adjust this for sensitivity
+        self.blink_flag = False
+        self.blink_threshold = 0.6  # Adjusted threshold
         self.double_blink_time = 500  # Maximum time (ms) for a double blink
+        self.ear_deque = deque(maxlen=10)  # Smoothing the EAR calculation
 
         # Initialize MediaPipe FaceMesh
         self.mp_face_mesh = mp.solutions.face_mesh
@@ -60,8 +63,13 @@ class EyeBlinkDetector(QThread):
                         face_landmarks.landmark, [362, 385, 387, 386, 374, 380, 381, 263]
                     )
 
-                    if left_eye_ratio < self.blink_threshold and right_eye_ratio < self.blink_threshold:
-                        self.detect_blink()
+                    ear = (left_eye_ratio + right_eye_ratio) / 2
+                    self.ear_deque.append(ear)
+                    smoothed_ear = sum(self.ear_deque) / len(self.ear_deque)
+
+                    # EAR visualization and logging
+                    cv2.putText(frame, f"EAR: {smoothed_ear:.2f}", (30, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+                    self.detect_blink(smoothed_ear)
 
             cv2.imshow("Camera Feed", frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -70,15 +78,24 @@ class EyeBlinkDetector(QThread):
         cap.release()
         cv2.destroyAllWindows()
 
-    def detect_blink(self):
+    def detect_blink(self, smoothed_ear):
         import time
         current_time = time.time() * 1000  # Current time in milliseconds
-        if self.last_blink_time and (current_time - self.last_blink_time) < self.double_blink_time:
-            self.blink_detected.emit(2)  # Double blink detected
-            self.last_blink_time = None
+        print(f"Current EAR: {smoothed_ear:.2f}")  # Debug EAR value
+
+        if smoothed_ear < self.blink_threshold:
+            if not self.blink_flag:
+                self.blink_flag = True
+                if self.last_blink_time and (current_time - self.last_blink_time) < self.double_blink_time:
+                    print("Double Blink Detected!")  # Debug double blink
+                    self.blink_detected.emit(2)  # Double blink detected
+                    self.last_blink_time = None
+                else:
+                    print("Single Blink Detected!")  # Debug single blink
+                    self.blink_detected.emit(1)  # Single blink detected
+                    self.last_blink_time = current_time
         else:
-            self.blink_detected.emit(1)  # Single blink detected
-            self.last_blink_time = current_time
+            self.blink_flag = False
 
     def stop(self):
         self.running = False
@@ -136,8 +153,15 @@ class EyeControlGUI(QMainWindow):
         self.upper_body_button = QPushButton("Upper Body")
         self.main_layout.addWidget(self.upper_body_button)
 
+        self.nested_options = {
+            "Sideways": ["Left", "Right"],
+            "Upper Body": ["30°", "45°", "60°"],
+            "Lower Body": ["30°", "45°", "60°"],
+        }
+
         self.option_list = [self.sideways_button, self.lower_body_button, self.upper_body_button]
         self.current_index = 0
+        self.current_nesting = None
         self.highlight_option()  # Start with the first option highlighted
 
         self.eye_blink_detector = EyeBlinkDetector(camera_url)
@@ -161,7 +185,19 @@ class EyeControlGUI(QMainWindow):
 
     def select_option(self):
         selected_button = self.option_list[self.current_index - 1]
-        selected_button.click()
+        text = selected_button.text()
+        if text in self.nested_options:
+            self.show_nested_options(text)
+
+    def show_nested_options(self, category):
+        self.current_nesting = category
+        self.layout.takeAt(1)  # Remove options stack
+        self.nested_layout = QVBoxLayout()
+        self.main_widget.setLayout(self.nested_layout)
+
+        for option in self.nested_options[category]:
+            button = QPushButton(option)
+            self.nested_layout.addWidget(button)
 
     def closeEvent(self, event):
         self.eye_blink_detector.stop()
